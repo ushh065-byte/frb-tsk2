@@ -528,6 +528,12 @@ class QemuOJApp:
             self.log(f"正常通过: {ac_count}/{len(cases)}")
             self.calculate_survival_rate()
 
+            if self.config.get("enable_coverage_embedded", False):
+                self._run_embedded_coverage_host(
+                    prepared_code=prepared_code,
+                    cases=cases,
+                )
+
         except Exception as e:
             self.log(f"裸机评测错误: {str(e)}")
             messagebox.showerror("错误", str(e))
@@ -535,6 +541,34 @@ class QemuOJApp:
             self.judge_running = False
             self.root.after(0, lambda: self.btn_judge.config(state="normal"))
             self.root.after(0, lambda: self.btn_stop.config(state="disabled"))
+
+    def _run_embedded_coverage_host(self, prepared_code: str, cases: list) -> None:
+        """课堂级 gcov：宿主 gcc 近似（不参与 AC/WA）。仅在裸机评测成功后调用。"""
+        task2_dir = Path(__file__).resolve().parent
+        in_paths = [(task2_dir / c["in_path"]).resolve() for c in cases]
+        try:
+            from core.coverage_embedded import run_embedded_host_coverage
+
+            res = run_embedded_host_coverage(
+                prepared_user_c=prepared_code,
+                task2_root=task2_dir,
+                problem_id=self.current_problem,
+                case_in_paths=in_paths,
+                log=self.log,
+            )
+            st = res.get("summary_text") or ""
+            if not st:
+                return
+
+            def _popup():
+                messagebox.showinfo(
+                    "课堂覆盖率 (gcov 近似)",
+                    st[:900] + ("…" if len(st) > 900 else ""),
+                )
+
+            self.root.after(0, _popup)
+        except Exception as e:
+            self.log(f"宿主覆盖率失败: {e}")
 
     def inject_fault(self, fault_type="memory_bitflip"):
         if fault_type == "memory_bitflip":

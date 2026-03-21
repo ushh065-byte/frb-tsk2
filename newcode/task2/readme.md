@@ -59,6 +59,19 @@ curl -X POST "http://localhost:8000/api/v1/judge" -H "Content-Type: application/
 
 `clang-tidy -p <task2目录> P0002/std.c`
 
+## GUI 课堂覆盖率（gcov，仅裸机评测）
+
+- **配置**：在 `config.json` 顶层设置 `"enable_coverage_embedded": true`。默认 `false`，避免额外编译耗时。
+- **触发时机**：仅在 **「裸机 Cortex-M UART」** 评测**成功跑完全部测例流程**后执行；**不参与 AC/WA**，结果写入日志并弹出摘要对话框。
+- **实现方式（宿主近似）**：QEMU stm32vldiscovery 镜像侧**无通用文件系统写 `.gcda`**，因此采用课堂折中——用本机 **`gcc --coverage`** 将「去掉 `main` 的题解 + `uart_oj_rx_poll.c` + `coverage_host_stubs.c` + `coverage_host_driver.c`」链接为宿主程序，按 `data/*.in` 生成与 `BareMetalUartRunner` 一致的 UART 字节流，逐测例运行以合并 `.gcda`，再调用 **`gcov -b`** 汇总**行覆盖率、分支覆盖率**。
+- **与 DO-178C MC/DC**：此处为 **gcov 行/分支%**，**不是**形式化 MC/DC；文档与弹窗中已标明「课堂近似」。
+- **依赖**：`PATH` 中可找到 **`gcc` 与 `gcov`**（Windows 常见为 MSYS2/MinGW-w64，与 `arm-none-eabi-gcc` 可并存）。
+- **命令行自检**（在 `task2/` 下）：
+
+```bash
+python -c "from core.coverage_embedded import self_check; print(self_check())"
+```
+
 ## 目录映射表（原 `core/` → FastAPI）
 | 原文件路径（task2/core/） | FastAPI 模块（task2/app/） |
 |---|---|
