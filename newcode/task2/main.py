@@ -7,14 +7,19 @@ import json
 import time
 import subprocess
 import random  # 新增随机数模块
+from pathlib import Path
 
 from core.oj_engine import OJEngine
+from core.baremetal_builder import BareMetalBuilder
+from core.baremetal_code_prep import prepare_baremetal_uart_code
+from core.baremetal_uart_runner import BareMetalUartRunner
 from core.ssh_executor import SSHExecutor
 from core.qemu_manager import QemuManager
 from core.config import load_config, scan_problems
 from ui.components import OJComponents
 from ui.md_viewer import MDViewer
-from core.project_manager import create_user_project 
+from core.project_manager import create_user_project
+from core.static_analysis import build_clang_tidy_command
 
 class QemuOJApp:
     def __init__(self):
@@ -30,6 +35,9 @@ class QemuOJApp:
         self.judge_running = False
         self.total_tests = 0  # 总测试用例数（含故障注入）
         self.successful_tests = 0  # 成功恢复的测试用例数
+        self.judge_mode = tk.StringVar(value="cortexm")  # GUI 默认仍可跑普通 C，首次以普通 C 为准
+        self.bare_builder = BareMetalBuilder()
+        self.bare_runner = None
         
         self.setup_ui()
         self.root.after(100, self.init_qemu)
@@ -48,6 +56,16 @@ class QemuOJApp:
         self.prob_combo.bind("<<ComboboxSelected>>", lambda e: self.load_problem())
 
         ttk.Separator(toolbar, orient="vertical").pack(side=tk.LEFT, padx=10, fill="y")
+
+        ttk.Label(toolbar, text="评测模式:").pack(side=tk.LEFT, padx=5)
+        self.mode_combo = ttk.Combobox(
+            toolbar,
+            values=["普通 C", "裸机 Cortex-M UART"],
+            state="readonly",
+            width=18,
+        )
+        self.mode_combo.set("普通 C")
+        self.mode_combo.pack(side=tk.LEFT, padx=5)
         
         self.btn_judge = ttk.Button(toolbar, text="▶ 提交评测", command=self.start_judge_thread)
         self.btn_judge.pack(side=tk.LEFT, padx=5)
@@ -99,6 +117,18 @@ class QemuOJApp:
         self.log_text.insert("end", f"[{timestamp}] {message}\n")
         self.log_text.see("end")
         self.log_text.config(state="disabled")
+
+    def _do_update(self, name, status, time_val=None, info=None):
+        """主线程更新结果表（由 update_case_result 经 root.after 调度）。"""
+        time_str = "-" if time_val is None else str(time_val)
+        info_str = "-" if info is None else str(info)
+        for item in self.res_table.get_children():
+            vals = self.res_table.item(item, "values")
+            if vals and vals[0] == name:
+                self.res_table.item(
+                    item, values=(name, status, time_str, info_str)
+                )
+                break
 
     def refresh_problems(self):
         problems = scan_problems()
@@ -186,33 +216,94 @@ class QemuOJApp:
     def run_static_check(self):
         user_code = self.editor.get("1.0", tk.END)
         if not user_code.strip():
-            self.log("静态检查：代码为空，跳过")
+            self.root.after(0, lambda: self.log("静态检查：代码为空，跳过"))
             return
 
-        temp_c_path = "temp_static_check.c"
-        with open(temp_c_path, "w", encoding="utf-8") as f:
-            f.write(user_code)
+        task2_dir = Path(__file__).resolve().parent
+        temp_c_path = task2_dir / "temp_static_check.c"
 
         try:
-            self.log("开始静态检查...")
-            cmd = [
-                "clang-tidy", temp_c_path, "--", "-std=c11", 
-                "-target", "x86_64-pc-windows-msvc"
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            output = result.stdout + result.stderr
-            self.log("静态检查完成")
-            self.log(output)
-            if "error:" in output or "warning:" in output:
-                messagebox.showinfo("静态检查结果", "发现潜在问题，详见日志")
-            else:
-                messagebox.showinfo("静态检查结果", "✅ 未发现明显问题")
+            temp_c_path.write_text(user_code, encoding="utf-8")
+        except OSError as e:
+
+            def _write_err(msg=str(e)):
+                self.log(f"静态检查：无法写入临时文件: {msg}")
+
+            self.root.after(0, _write_err)
+            return
+
+        def _log_start():
+            self.log("开始静态检查（嵌入式 C：arm-none-eabi / freestanding / Cortex-M3）...")
+
+        self.root.after(0, _log_start)
+
+        try:
+            cmd, notes = build_clang_tidy_command(
+                source_file=temp_c_path,
+                task2_dir=task2_dir,
+            )
+            for line in notes:
+
+                def _note(m=line):
+                    self.log(m)
+
+                self.root.after(0, _note)
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=120,
+                cwd=str(task2_dir),
+            )
+            output = (result.stdout or "") + (result.stderr or "")
+            lowered = output.lower()
+            has_diag = (
+                result.returncode != 0
+                or "warning:" in lowered
+                or "error:" in lowered
+            )
+
+            def _finish():
+                self.log("静态检查完成")
+                self.log(output)
+                if has_diag:
+                    messagebox.showinfo(
+                        "静态检查结果",
+                        "发现潜在问题或工具告警，详见日志",
+                    )
+                else:
+                    messagebox.showinfo("静态检查结果", "✅ 未发现明显问题")
+
+            self.root.after(0, _finish)
+        except FileNotFoundError:
+            def _no_clang_tidy():
+                self.log(
+                    "静态检查失败：未找到 clang-tidy，请安装 LLVM 并将 clang-tidy 加入 PATH"
+                )
+                messagebox.showerror("错误", "未找到 clang-tidy（请安装 LLVM）")
+
+            self.root.after(0, _no_clang_tidy)
+        except subprocess.TimeoutExpired:
+
+            def _timeout():
+                self.log("静态检查超时（>120s），已终止")
+                messagebox.showerror("错误", "静态检查超时")
+
+            self.root.after(0, _timeout)
         except Exception as e:
-            self.log(f"静态检查失败：{str(e)}")
-            messagebox.showerror("错误", f"静态检查失败：{str(e)}")
+
+            def _err(msg=str(e)):
+                self.log(f"静态检查失败：{msg}")
+                messagebox.showerror("错误", f"静态检查失败：{msg}")
+
+            self.root.after(0, _err)
         finally:
-            if os.path.exists(temp_c_path):
-                os.remove(temp_c_path)
+            try:
+                if temp_c_path.is_file():
+                    temp_c_path.unlink()
+            except OSError:
+                pass
 
     def run_judge(self):
         try:
@@ -320,6 +411,131 @@ class QemuOJApp:
             self.root.after(0, lambda: self.btn_judge.config(state="normal"))
             self.root.after(0, lambda: self.btn_stop.config(state="disabled"))
 
+    def run_judge_baremetal_uart(self):
+        """
+        Cortex-M bare-metal UART OJ mode (QEMU stm32vldiscovery + USART1).
+        - 每个测试点一次性启动 QEMU，喂入 UART 输入，捕获 UART 输出后终止 QEMU
+        - 故障注入：启动后通过 QEMU monitor 下发 inject_error，然后再喂入同一组输入
+        - 恢复判定：继续复用 ERROR_RECOVERED（来自 QEMU monitor 输出）
+        """
+        try:
+            self.log("开始裸机 Cortex-M UART 评测...")
+
+            # Ensure QEMU manager exists (init_qemu creates it once).
+            if self.qemu_mgr is None:
+                raise RuntimeError("QEMU 管理器尚未初始化")
+
+            bare_runner = BareMetalUartRunner(self.qemu_mgr)
+
+            job_tmp_dir = os.path.join(".temp", f"gui_job_{int(time.time())}")
+            os.makedirs(job_tmp_dir, exist_ok=True)
+
+            local_main_c = os.path.join(job_tmp_dir, "main.c")
+            with open(local_main_c, "w", encoding="utf-8") as f:
+                user_code = self.editor.get(1.0, tk.END)
+                prepared_code = prepare_baremetal_uart_code(user_code)
+                f.write(prepared_code)
+
+            self.log("交叉编译固件中...")
+            artifacts = self.bare_builder.build(Path(local_main_c), Path(job_tmp_dir) / "firmware")
+
+            cases = OJEngine.get_test_cases(self.current_problem)
+            ac_count = 0
+
+            for i, case in enumerate(cases):
+                if not self.judge_running:
+                    self.log("评测已取消")
+                    self.update_case_result(case["name"], "取消", "-", "用户停止")
+                    break
+
+                self.update_case_result(case["name"], "运行中", "-", "-")
+                self.log(f"测试 {case['name']} (正常)...")
+
+                in_text = open(case["in_path"], "r", encoding="utf-8", errors="ignore").read()
+                expected = open(case["out_path"], "r", encoding="utf-8", errors="ignore").read()
+
+                # Normal run
+                recovery_event = threading.Event()
+
+                def _logger(msg: str):
+                    if msg:
+                        self.log(msg)
+                        if "ERROR_RECOVERED" in msg:
+                            recovery_event.set()
+
+                normal_res = bare_runner.run_once(
+                    artifacts.bin_path,
+                    in_text,
+                    logger=_logger,
+                    total_timeout_sec=10.0,
+                    uart_connect_timeout_sec=5.0,
+                    uart_output_idle_sec=0.35,
+                )
+
+                is_ac = OJEngine.compare(expected, normal_res.actual_output)
+                status = "AC" if is_ac else "WA"
+                if is_ac:
+                    ac_count += 1
+                self.update_case_result(
+                    case["name"],
+                    status,
+                    normal_res.exec_time_ms,
+                    "通过" if is_ac else "答案错误",
+                )
+                self.log(f"{case['name']}: {status} ({normal_res.exec_time_ms}ms)")
+
+                # Fault injection run
+                self.log("\n--- 注入故障后重新测试 ---")
+                recovery_event.clear()
+
+                addr = random.randint(0x20000000, 0x20002000 - 1)
+                bit = random.randint(0, 31)
+
+                injected_res = bare_runner.run_once(
+                    artifacts.bin_path,
+                    in_text,
+                    logger=_logger,
+                    inject_error_addr=addr,
+                    inject_error_bit=bit,
+                    recovery_event=recovery_event,
+                    total_timeout_sec=10.0,
+                    uart_connect_timeout_sec=5.0,
+                    uart_output_idle_sec=0.35,
+                )
+
+                recovery_success = bool(injected_res.recovery_success)
+                if not recovery_success:
+                    self.update_case_result(
+                        case["name"],
+                        "RE",
+                        injected_res.exec_time_ms,
+                        "故障后未恢复",
+                    )
+                    self.log(f"{case['name']}: RE（故障后未恢复） ({injected_res.exec_time_ms}ms)")
+                else:
+                    is_ac2 = OJEngine.compare(expected, injected_res.actual_output)
+                    status2 = "AC" if is_ac2 else "WA"
+                    self.update_case_result(
+                        case["name"],
+                        status2,
+                        injected_res.exec_time_ms,
+                        "通过" if is_ac2 else "答案错误",
+                    )
+                    self.log(f"{case['name']}: {status2} ({injected_res.exec_time_ms}ms) - 恢复成功")
+
+            total = len(cases) * 2
+            self.log("\n=== 最终评测结果 ===")
+            self.log(f"正常通过: {ac_count}/{len(cases)}")
+            self.calculate_survival_rate()
+
+        except Exception as e:
+            self.log(f"裸机评测错误: {str(e)}")
+            messagebox.showerror("错误", str(e))
+        finally:
+            self.judge_running = False
+            self.root.after(0, lambda: self.btn_judge.config(state="normal"))
+            self.root.after(0, lambda: self.btn_stop.config(state="disabled"))
+
     def inject_fault(self, fault_type="memory_bitflip"):
         if fault_type == "memory_bitflip":
             address = random.randint(0x20000000, 0x20010000)
@@ -355,12 +571,19 @@ class QemuOJApp:
         self.judge_running = True
         self.btn_judge.config(state="disabled")
         self.btn_stop.config(state="normal")
-        threading.Thread(target=self.run_judge, daemon=True).start()
+        mode = self.mode_combo.get() if hasattr(self, "mode_combo") else "普通 C"
+        target = self.run_judge_baremetal_uart if "裸机" in mode else self.run_judge
+        threading.Thread(target=target, daemon=True).start()
 
     def stop_judge(self):
         if self.executor:
             self.executor.stop()
             self.log("正在停止评测...")
+        if self.qemu_mgr:
+            try:
+                self.qemu_mgr.stop_qemu()
+            except Exception:
+                pass
         self.judge_running = False
         self.btn_judge.config(state="normal")
         self.btn_stop.config(state="disabled")

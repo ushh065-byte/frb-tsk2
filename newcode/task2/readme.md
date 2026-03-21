@@ -44,6 +44,21 @@ curl -X POST "http://localhost:8000/api/v1/judge" -H "Content-Type: application/
 }
 ```
 
+## GUI 静态检查（嵌入式 C）
+
+工具栏「静态检查」对**编辑器中的代码**运行 `clang-tidy`，编译参数与裸机固件一致（`-target arm-none-eabi`、`--config-file task2/.clang-tidy`、`-mcpu=cortex-m3`、`-ffreestanding`、`-I baremetal` 等）。
+
+**依赖：**
+
+- `clang-tidy`（LLVM），需在 `PATH` 中。
+- **推荐**安装 [Arm GNU Toolchain](https://developer.arm.com/Tools%20and%20Software/GNU%20Toolchain)（`arm-none-eabi-gcc`），以便自动加入 `stdint.h`、`stdio.h` 等头路径。若未安装，会尝试使用本机 `clang` 的 `-print-resource-dir` 下内置头**降级**；仍失败时日志会提示安装工具链。
+
+临时文件写入 `task2/temp_static_check.c`（运行结束后删除），工作目录固定为 `task2/`，保证能读取 `task2/.clang-tidy`。
+
+若工程根下存在 `compile_commands.json`，可自行对**已收录**的源文件执行：
+
+`clang-tidy -p <task2目录> P0002/std.c`
+
 ## 目录映射表（原 `core/` → FastAPI）
 | 原文件路径（task2/core/） | FastAPI 模块（task2/app/） |
 |---|---|
